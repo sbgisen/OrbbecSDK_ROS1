@@ -1159,8 +1159,12 @@ void OBCameraNode::publishStaticTF(const ros::Time& t, const tf2::Vector3& trans
   msg.transform.translation.x = trans[2] / 1000.0;
   msg.transform.translation.y = -trans[0] / 1000.0;
   msg.transform.translation.z = -trans[1] / 1000.0;
+
   msg.transform.rotation.x = q.getX();
   msg.transform.rotation.y = q.getY();
+  if (to == frame_id_[COLOR]) {
+    msg.transform.rotation.y *= -1.0;
+  }
   msg.transform.rotation.z = q.getZ();
   msg.transform.rotation.w = q.getW();
   static_tf_msgs_.push_back(msg);
