@@ -355,6 +355,7 @@ class OBCameraNode {
   std::shared_ptr<camera_info_manager::CameraInfoManager> ir_camera_info_manager_ = nullptr;
   std::string ir_info_uri_;
   std::string color_info_uri_;
+  double ir_scale_ = 1.0;
   bool enable_d2c_viewer_ = false;
   std::shared_ptr<D2CViewer> d2c_viewer_ = nullptr;
   bool enable_pipeline_ = false;
