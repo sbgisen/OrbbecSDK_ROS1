@@ -39,6 +39,7 @@
 #include "orbbec_camera/d2c_viewer.h"
 #include "orbbec_camera/GetCameraParams.h"
 #include <boost/optional.hpp>
+#include <image_transport/image_transport.h>
 
 #include "jpeg_decoder.h"
 
@@ -88,14 +89,19 @@ class OBCameraNode {
   void onNewFrameCallback(const std::shared_ptr<ob::Frame>& frame,
                           const stream_index_pair& stream_index);
 
+  void onNewIMUFrameSyncOutputCallback(const std::shared_ptr<ob::Frame>& aframe,
+                                       const std::shared_ptr<ob::Frame>& gframe);
+
   void onNewIMUFrameCallback(const std::shared_ptr<ob::Frame>& frame,
                              const stream_index_pair& stream_index);
 
   bool decodeColorFrameToBuffer(const std::shared_ptr<ob::Frame>& frame, uint8_t* dest);
 
-  std::shared_ptr<ob::Frame> decodeIRMJPGFrame(const std::shared_ptr<ob::Frame> &frame);
+  std::shared_ptr<ob::Frame> decodeIRMJPGFrame(const std::shared_ptr<ob::Frame>& frame);
 
   void onNewFrameSetCallback(const std::shared_ptr<ob::FrameSet>& frame_set);
+
+  void onNewColorFrameCallback();
 
   void publishPointCloud(const std::shared_ptr<ob::FrameSet>& frame_set);
 
@@ -117,6 +123,8 @@ class OBCameraNode {
                        const std::string& from, const std::string& to);
 
   void startStreams();
+
+  void startIMUSyncStream();
 
   void startAccel();
 
@@ -253,9 +261,14 @@ class OBCameraNode {
 
   bool switchIRDataSourceChannelCallback(SetStringRequest& request, SetStringResponse& response);
 
+  bool setIRLongExposureCallback(std_srvs::SetBoolRequest& request,
+                                 std_srvs::SetBoolResponse& response);
+
  private:
   ros::NodeHandle nh_;
   ros::NodeHandle nh_private_;
+  ros::NodeHandle nh_rgb_;
+  ros::NodeHandle nh_ir_;
   std::shared_ptr<ob::Device> device_ = nullptr;
   std::shared_ptr<ob::DeviceInfo> device_info_ = nullptr;
   std::atomic_bool is_running_{false};
@@ -273,7 +286,10 @@ class OBCameraNode {
   std::map<stream_index_pair, std::shared_ptr<ob::StreamProfileList>> supported_profiles_;
   std::map<stream_index_pair, std::string> stream_name_;
   std::map<stream_index_pair, std::atomic_bool> save_images_;
-  std::map<stream_index_pair, ros::Publisher> image_publishers_;
+  std::map<stream_index_pair, int> save_images_count_;
+  int max_save_images_count_ = 10;
+  std::map<stream_index_pair, image_transport::Publisher> image_publishers_;
+  std::map<stream_index_pair, uint32_t> image_seq_;
   std::map<stream_index_pair, ros::Publisher> camera_info_publishers_;
   std::map<stream_index_pair, ob::FrameCallback> frame_callback_;
   std::map<stream_index_pair, sensor_msgs::CameraInfo> camera_infos_;
@@ -291,6 +307,8 @@ class OBCameraNode {
   int default_white_balance_ = 0;
   std::string camera_link_frame_id_ = "camera_link";
   std::string camera_name_ = "camera";
+  const std::string imu_optical_frame_id_ = "camera_gyro_accel_optical_frame";
+  const std::string imu_frame_id_ = "camera_gyro_accel_frame";
   std::map<stream_index_pair, ros::ServiceServer> get_exposure_srv_;
   std::map<stream_index_pair, ros::ServiceServer> set_exposure_srv_;
   std::map<stream_index_pair, ros::ServiceServer> reset_exposure_srv_;
@@ -321,6 +339,7 @@ class OBCameraNode {
   ros::ServiceServer save_images_srv_;
   ros::ServiceServer switch_ir_mode_srv_;
   ros::ServiceServer switch_ir_data_source_channel_srv_;
+  ros::ServiceServer set_ir_long_exposure_srv_;
 
   bool publish_tf_ = true;
   std::shared_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_ = nullptr;
@@ -332,8 +351,8 @@ class OBCameraNode {
   bool depth_registration_ = false;
   bool enable_frame_sync_ = false;
   std::recursive_mutex device_lock_;
-  std::shared_ptr<camera_info_manager::CameraInfoManager> color_camera_info_ = nullptr;
-  std::shared_ptr<camera_info_manager::CameraInfoManager> ir_camera_info_ = nullptr;
+  std::shared_ptr<camera_info_manager::CameraInfoManager> color_camera_info_manager_ = nullptr;
+  std::shared_ptr<camera_info_manager::CameraInfoManager> ir_camera_info_manager_ = nullptr;
   std::string ir_info_uri_;
   std::string color_info_uri_;
   bool enable_d2c_viewer_ = false;
@@ -354,9 +373,12 @@ class OBCameraNode {
   bool enable_soft_filter_ = true;
   bool enable_color_auto_exposure_ = true;
   bool enable_ir_auto_exposure_ = true;
+  bool enable_ir_long_exposure_ = false;
   bool enable_ldp_ = true;
   int soft_filter_max_diff_ = -1;
   int soft_filter_speckle_size_ = -1;
+  std::string depth_filter_config_;
+  bool enable_depth_filter_ = false;
 
   // Only for Gemini2 device
   bool enable_hardware_d2d_ = true;
@@ -371,7 +393,6 @@ class OBCameraNode {
   std::string depth_precision_str_;
   OB_DEPTH_PRECISION_LEVEL depth_precision_ = OB_PRECISION_1MM;
   // IMU
-
   std::map<stream_index_pair, ros::Publisher> imu_publishers_;
   std::map<stream_index_pair, std::string> imu_rate_;
   std::map<stream_index_pair, std::string> imu_range_;
@@ -383,6 +404,11 @@ class OBCameraNode {
   std::deque<IMUData> imu_history_;
   IMUData accel_data_{ACCEL, {0, 0, 0}, -1.0};
 
+  bool enable_sync_output_accel_gyro_ = false;
+  std::shared_ptr<ob::Pipeline> imuPipeline_ = nullptr;
+  ros::Publisher imu_gyro_accel_publisher_;
+  bool imu_sync_output_start_ = false;
+
   // mjpeg decoder
   std::shared_ptr<JPEGDecoder> mjpeg_decoder_ = nullptr;
   uint8_t* rgb_buffer_ = nullptr;
@@ -391,6 +417,16 @@ class OBCameraNode {
   // double infrared
   bool enable_left_ir_ = false;
   bool enable_right_ir_ = false;
+
+  // For color
+  std::queue<std::shared_ptr<ob::FrameSet>> colorFrameQueue_;
+  std::shared_ptr<std::thread> colorFrameThread_ = nullptr;
+  std::mutex colorFrameMtx_;
+  std::condition_variable colorFrameCV_;
+  bool use_hardware_time_ = false;
+  // ordered point cloud
+  bool ordered_pc_ = false;
+  bool enable_compressed_color_ = false;
 };
 
 }  // namespace orbbec_camera

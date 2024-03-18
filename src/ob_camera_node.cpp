@@ -34,6 +34,8 @@ OBCameraNode::OBCameraNode(ros::NodeHandle& nh, ros::NodeHandle& nh_private,
   stream_name_[INFRA1] = "ir2";
   stream_name_[ACCEL] = "accel";
   stream_name_[GYRO] = "gyro";
+  nh_ir_ = ros::NodeHandle(stream_name_[INFRA0]);
+  nh_rgb_ = ros::NodeHandle(stream_name_[COLOR]);
   init();
 }
 
@@ -72,6 +74,12 @@ OBCameraNode::~OBCameraNode() {
   if (tf_thread_ && tf_thread_->joinable()) {
     tf_thread_->join();
   }
+
+  if (colorFrameThread_ && colorFrameThread_->joinable()) {
+    colorFrameCV_.notify_all();
+    colorFrameThread_->join();
+  }
+
   ROS_INFO_STREAM("OBCameraNode::~OBCameraNode() stop stream");
   stopStreams();
   ROS_INFO_STREAM("OBCameraNode::~OBCameraNode() delete rgb_buffer");
@@ -122,6 +130,7 @@ void OBCameraNode::getParameters() {
   for (const auto& stream_index : IMAGE_STREAMS) {
     depth_aligned_frame_id_[stream_index] = optical_frame_id_[COLOR];
   }
+  use_hardware_time_ = nh_private_.param<bool>("use_hardware_time", false);
   publish_tf_ = nh_private_.param<bool>("publish_tf", false);
   depth_registration_ = nh_private_.param<bool>("depth_registration", false);
   enable_frame_sync_ = nh_private_.param<bool>("enable_frame_sync", false);
@@ -136,6 +145,7 @@ void OBCameraNode::getParameters() {
   enable_soft_filter_ = nh_private_.param<bool>("enable_soft_filter", true);
   enable_color_auto_exposure_ = nh_private_.param<bool>("enable_color_auto_exposure", true);
   enable_ir_auto_exposure_ = nh_private_.param<bool>("enable_ir_auto_exposure", true);
+  enable_ir_long_exposure_ = nh_private_.param<bool>("enable_ir_long_exposure", false);
   sync_mode_str_ = nh_private_.param<std::string>("sync_mode", "free_run");
   std::transform(sync_mode_str_.begin(), sync_mode_str_.end(), sync_mode_str_.begin(), ::toupper);
   sync_mode_ = OBSyncModeFromString(sync_mode_str_);
@@ -152,9 +162,20 @@ void OBCameraNode::getParameters() {
   enable_ldp_ = nh_private_.param<bool>("enable_ldp", true);
   soft_filter_max_diff_ = nh_private_.param<int>("soft_filter_max_diff", -1);
   soft_filter_speckle_size_ = nh_private_.param<int>("soft_filter_speckle_size", -1);
+  depth_filter_config_ = nh_private_.param<std::string>("depth_filter_config", "");
+  ordered_pc_ = nh_private_.param<bool>("ordered_pc", false);
+  max_save_images_count_ = nh_private_.param<int>("max_save_images_count", 10);
+  if (!depth_filter_config_.empty()) {
+    enable_depth_filter_ = true;
+  }
+
+  enable_sync_output_accel_gyro_ = nh_private_.param<bool>("enable_sync_output_accel_gyro", false);
   for (const auto& stream_index : HID_STREAMS) {
     std::string param_name = "enable_" + stream_name_[stream_index];
     enable_stream_[stream_index] = nh_private_.param<bool>(param_name, false);
+    if (enable_sync_output_accel_gyro_) {
+      enable_stream_[stream_index] = true;
+    }
     param_name = stream_name_[stream_index] + "_rate";
     imu_rate_[stream_index] = nh_private_.param<std::string>(param_name, "");
     param_name = stream_name_[stream_index] + "_range";
@@ -177,6 +198,8 @@ void OBCameraNode::startStreams() {
     CHECK_NOTNULL(pipeline_.get());
     if (enable_frame_sync_) {
       pipeline_->enableFrameSync();
+    } else {
+      pipeline_->disableFrameSync();
     }
     try {
       setupPipelineConfig();
@@ -197,6 +220,11 @@ void OBCameraNode::startStreams() {
       ROS_ERROR_STREAM("failed to start pipeline");
       throw;
     }
+
+    if (!colorFrameThread_ && enable_stream_[COLOR]) {
+      ROS_INFO_STREAM("Create color frame read thread.");
+      colorFrameThread_ = std::make_shared<std::thread>([this]() { onNewColorFrameCallback(); });
+    }
     pipeline_started_ = true;
   } else {
     for (const auto& stream_index : IMAGE_STREAMS) {
@@ -204,6 +232,53 @@ void OBCameraNode::startStreams() {
         startStream(stream_index);
       }
     }
+  }
+}
+
+void OBCameraNode::startIMUSyncStream() {
+  if (!imuPipeline_) {
+    ROS_INFO_STREAM("start IMU sync stream failed, IMU pileline is not initialized!");
+    return;
+  }
+
+  if (imu_sync_output_start_) {
+    ROS_INFO_STREAM("IMU sync stream already started.");
+    return;
+  }
+
+  // ACCEL
+  auto accelProfiles = imuPipeline_->getStreamProfileList(OB_SENSOR_ACCEL);
+  auto accel_range = fullAccelScaleRangeFromString(imu_range_[ACCEL]);
+  auto accel_rate = sampleRateFromString(imu_rate_[ACCEL]);
+  auto accelProfile = accelProfiles->getAccelStreamProfile(accel_range, accel_rate);
+  // GYRO
+  auto gyroProfiles = imuPipeline_->getStreamProfileList(OB_SENSOR_GYRO);
+  auto gyro_range = fullGyroScaleRangeFromString(imu_range_[GYRO]);
+  auto gyro_rate = sampleRateFromString(imu_rate_[GYRO]);
+  auto gyroProfile = gyroProfiles->getGyroStreamProfile(gyro_range, gyro_rate);
+  std::shared_ptr<ob::Config> imuConfig = std::make_shared<ob::Config>();
+  imuConfig->enableStream(accelProfile);
+  imuConfig->enableStream(gyroProfile);
+  imuPipeline_->enableFrameSync();
+  imuPipeline_->start(imuConfig, [&](std::shared_ptr<ob::Frame> frame) {
+    auto frameSet = frame->as<ob::FrameSet>();
+    auto aFrame = frameSet->getFrame(OB_FRAME_ACCEL);
+    auto gFrame = frameSet->getFrame(OB_FRAME_GYRO);
+    if (aFrame && gFrame) {
+      onNewIMUFrameSyncOutputCallback(aFrame, gFrame);
+    }
+  });
+
+  imu_sync_output_start_ = true;
+  if (!imu_sync_output_start_) {
+    ROS_ERROR_STREAM(
+        "Failed to start IMU stream, please check the imu_rate and imu_range parameters.");
+  } else {
+    ROS_INFO_STREAM("start accel stream with range: " << fullAccelScaleRangeToString(accel_range)
+                                                      << ",rate:" << sampleRateToString(accel_rate)
+                                                      << ", and start gyro stream with range:"
+                                                      << fullGyroScaleRangeToString(gyro_range)
+                                                      << ",rate:" << sampleRateToString(gyro_rate));
   }
 }
 
@@ -273,10 +348,14 @@ void OBCameraNode::startGyro() {
 }
 
 void OBCameraNode::startIMU(const stream_index_pair& stream_index) {
-  if (stream_index == ACCEL) {
-    startAccel();
-  } else if (stream_index == GYRO) {
-    startGyro();
+  if (enable_sync_output_accel_gyro_) {
+    startIMUSyncStream();
+  } else {
+    if (stream_index == ACCEL) {
+      startAccel();
+    } else if (stream_index == GYRO) {
+      startGyro();
+    }
   }
 }
 void OBCameraNode::startIMU() {
@@ -353,9 +432,20 @@ void OBCameraNode::stopIMU(const orbbec_camera::stream_index_pair& stream_index)
 }
 
 void OBCameraNode::stopIMU() {
-  for (const auto& stream_index : HID_STREAMS) {
-    if (imu_started_[stream_index]) {
-      stopIMU(stream_index);
+  if (enable_sync_output_accel_gyro_) {
+    if (!imu_sync_output_start_ || !imuPipeline_) {
+      return;
+    }
+    try {
+      imuPipeline_->stop();
+    } catch (const ob::Error& e) {
+      ROS_ERROR_STREAM("Failed to stop imu pipeline: " << e.getMessage());
+    }
+  } else {
+    for (const auto& stream_index : HID_STREAMS) {
+      if (imu_started_[stream_index]) {
+        stopIMU(stream_index);
+      }
     }
   }
 }
@@ -388,6 +478,11 @@ void OBCameraNode::startStream(const stream_index_pair& stream_index) {
   try {
     sensors_[stream_index]->startStream(profile, callback);
     stream_started_[stream_index] = true;
+
+    if (!colorFrameThread_ && stream_index == COLOR) {
+      ROS_INFO_STREAM("Create color frame read thread.");
+      colorFrameThread_ = std::make_shared<std::thread>([this]() { onNewColorFrameCallback(); });
+    }
     ROS_INFO_STREAM("Stream " << stream_name_[stream_index] << " started.");
   } catch (...) {
     ROS_ERROR_STREAM("Failed to start stream " << stream_name_[stream_index] << ".");
@@ -417,6 +512,7 @@ void OBCameraNode::publishPointCloud(const std::shared_ptr<ob::FrameSet>& frame_
         publishColoredPointCloud(frame_set);
       }
     }
+
     if (frame_set->depthFrame() != nullptr) {
       publishDepthPointCloud(frame_set);
     }
@@ -433,11 +529,11 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet>& f
   if (depth_cloud_pub_.getNumSubscribers() == 0 || !enable_point_cloud_) {
     return;
   }
-  if (!camera_params_ && depth_registration_) {
+
+  if (!camera_params_) {
     camera_params_ = pipeline_->getCameraParam();
-  } else if (!camera_params_) {
-    camera_params_ = getCameraDepthParam();
   }
+
   if (!camera_params_) {
     ROS_ERROR_STREAM("camera_params_ is null");
     return;
@@ -479,26 +575,35 @@ void OBCameraNode::publishDepthPointCloud(const std::shared_ptr<ob::FrameSet>& f
   const static float max_depth = MAX_DISTANCE / depth_scale;
   for (int y = 0; y < height; y++) {
     for (int x = 0; x < width; x++) {
+      bool valid_point = true;
       if (depth_data[y * width + x] < min_depth || depth_data[y * width + x] > max_depth) {
-        continue;
+        valid_point = false;
       }
-      float xf = (x - u0) * fdx;
-      float yf = (y - v0) * fdy;
-      float zf = depth_data[y * width + x] * depth_scale;
-      *iter_x = zf * xf / 1000.0;
-      *iter_y = zf * yf / 1000.0;
-      *iter_z = zf / 1000.0;
-      ++iter_x, ++iter_y, ++iter_z;
-      valid_count++;
+      if (valid_point || ordered_pc_) {
+        float xf = (x - u0) * fdx;
+        float yf = (y - v0) * fdy;
+        float zf = depth_data[y * width + x] * depth_scale;
+        *iter_x = zf * xf / 1000.0;
+        *iter_y = zf * yf / 1000.0;
+        *iter_z = zf / 1000.0;
+        ++iter_x, ++iter_y, ++iter_z;
+        valid_count++;
+      }
     }
   }
-  auto timestamp = frameTimeStampToROSTime(depth_frame->systemTimeStamp());
+  if (!ordered_pc_) {
+    cloud_msg_.is_dense = true;
+    cloud_msg_.width = valid_count;
+    cloud_msg_.height = 1;
+    modifier.resize(valid_count);
+  }
+  auto frame_time_stamp =
+      use_hardware_time_ ? depth_frame->timeStamp() : depth_frame->systemTimeStamp();
+  auto timestamp = frameTimeStampToROSTime(frame_time_stamp);
+  std::string frame_id =
+      depth_registration_ ? depth_aligned_frame_id_[COLOR] : optical_frame_id_[DEPTH];
   cloud_msg_.header.stamp = timestamp;
-  cloud_msg_.header.frame_id = optical_frame_id_[DEPTH];
-  cloud_msg_.is_dense = true;
-  cloud_msg_.width = valid_count;
-  cloud_msg_.height = 1;
-  modifier.resize(valid_count);
+  cloud_msg_.header.frame_id = frame_id;
   depth_cloud_pub_.publish(cloud_msg_);
   if (save_point_cloud_) {
     save_point_cloud_ = false;
@@ -572,39 +677,42 @@ void OBCameraNode::publishColoredPointCloud(const std::shared_ptr<ob::FrameSet>&
   static float max_depth = MAX_DISTANCE / depth_scale;
   for (int y = 0; y < color_height; y++) {
     for (int x = 0; x < color_width; x++) {
+      bool valid_point = true;
       float depth = depth_data[y * depth_width + x];
       if (depth < min_depth || depth > max_depth) {
-        continue;
+        valid_point = false;
       }
-      float xf = (x - u0) * fdx;
-      float yf = (y - v0) * fdy;
-      float zf = depth * depth_scale;
-      *iter_x = zf * xf / 1000.0;
-      *iter_y = zf * yf / 1000.0;
-      *iter_z = zf / 1000.0;
-      *iter_r = color_data[(y * color_width + x) * 3];
-      *iter_g = color_data[(y * color_width + x) * 3 + 1];
-      *iter_b = color_data[(y * color_width + x) * 3 + 2];
-      ++iter_x;
-      ++iter_y;
-      ++iter_z;
-      ++iter_r;
-      ++iter_g;
-      ++iter_b;
-      ++valid_count;
+      if (valid_point || ordered_pc_) {
+        float xf = (x - u0) * fdx;
+        float yf = (y - v0) * fdy;
+        float zf = depth * depth_scale;
+        *iter_x = zf * xf / 1000.0;
+        *iter_y = zf * yf / 1000.0;
+        *iter_z = zf / 1000.0;
+        *iter_r = color_data[(y * color_width + x) * 3];
+        *iter_g = color_data[(y * color_width + x) * 3 + 1];
+        *iter_b = color_data[(y * color_width + x) * 3 + 2];
+        ++iter_x;
+        ++iter_y;
+        ++iter_z;
+        ++iter_r;
+        ++iter_g;
+        ++iter_b;
+        ++valid_count;
+      }
     }
   }
-
-  if (valid_count == 0) {
-    return;
+  if (!ordered_pc_) {
+    cloud_msg_.is_dense = true;
+    cloud_msg_.width = valid_count;
+    cloud_msg_.height = 1;
+    modifier.resize(valid_count);
   }
-  auto timestamp = frameTimeStampToROSTime(depth_frame->systemTimeStamp());
+  auto frame_time_stamp =
+      use_hardware_time_ ? depth_frame->timeStamp() : depth_frame->systemTimeStamp();
+  auto timestamp = frameTimeStampToROSTime(frame_time_stamp);
   cloud_msg_.header.stamp = timestamp;
   cloud_msg_.header.frame_id = optical_frame_id_[COLOR];
-  cloud_msg_.is_dense = true;
-  cloud_msg_.width = valid_count;
-  cloud_msg_.height = 1;
-  modifier.resize(valid_count);
   depth_registered_cloud_pub_.publish(cloud_msg_);
   if (save_colored_point_cloud_) {
     save_colored_point_cloud_ = false;
@@ -648,6 +756,35 @@ sensor_msgs::Imu OBCameraNode::createUnitIMUMessage(const IMUData& accel_data,
   imu_msg.linear_acceleration.y = accel_data.data_.y();
   imu_msg.linear_acceleration.z = accel_data.data_.z();
   return imu_msg;
+}
+
+void OBCameraNode::onNewIMUFrameSyncOutputCallback(const std::shared_ptr<ob::Frame>& accelframe,
+                                                   const std::shared_ptr<ob::Frame>& gryoframe) {
+  if (!imu_gyro_accel_publisher_) {
+    ROS_ERROR_STREAM("stream Accel Gryo publisher not initialized");
+    return;
+  }
+  auto subscriber_count = imu_gyro_accel_publisher_.getNumSubscribers();
+  if (subscriber_count == 0) {
+    return;
+  }
+
+  auto imu_msg = sensor_msgs::Imu();
+  setDefaultIMUMessage(imu_msg);
+  imu_msg.header.frame_id = imu_optical_frame_id_;
+  auto timestamp = frameTimeStampToROSTime(accelframe->systemTimeStamp());
+  imu_msg.header.stamp = timestamp;
+  auto gyro_frame = gryoframe->as<ob::GyroFrame>();
+  auto gyroData = gyro_frame->value();
+  imu_msg.angular_velocity.x = gyroData.x;
+  imu_msg.angular_velocity.y = gyroData.y;
+  imu_msg.angular_velocity.z = gyroData.z;
+  auto accel_frame = accelframe->as<ob::AccelFrame>();
+  auto accelData = accel_frame->value();
+  imu_msg.linear_acceleration.x = accelData.x;
+  imu_msg.linear_acceleration.y = accelData.y;
+  imu_msg.linear_acceleration.z = accelData.z;
+  imu_gyro_accel_publisher_.publish(imu_msg);
 }
 
 void OBCameraNode::onNewIMUFrameCallback(const std::shared_ptr<ob::Frame>& frame,
@@ -730,7 +867,8 @@ bool OBCameraNode::decodeColorFrameToBuffer(const std::shared_ptr<ob::Frame>& fr
   return true;
 }
 
-std::shared_ptr<ob::Frame> OBCameraNode::decodeIRMJPGFrame(const std::shared_ptr<ob::Frame> &frame) {
+std::shared_ptr<ob::Frame> OBCameraNode::decodeIRMJPGFrame(
+    const std::shared_ptr<ob::Frame>& frame) {
   if (frame->format() == OB_FORMAT_MJPEG &&
       (frame->type() == OB_FRAME_IR || frame->type() == OB_FRAME_IR_LEFT ||
        frame->type() == OB_FRAME_IR_RIGHT)) {
@@ -744,7 +882,7 @@ std::shared_ptr<ob::Frame> OBCameraNode::decodeIRMJPGFrame(const std::shared_ptr
 
     uint32_t buffer_size = irRawMat.rows * irRawMat.cols * irRawMat.channels();
 
-    if(buffer_size > irFrame->dataSize()) {
+    if (buffer_size > irFrame->dataSize()) {
       ROS_ERROR_STREAM("Insufficient buffer size allocation,failed to decode ir mjpg frame!");
       return nullptr;
     }
@@ -768,11 +906,23 @@ void OBCameraNode::onNewFrameSetCallback(const std::shared_ptr<ob::FrameSet>& fr
     return;
   }
   try {
-    rgb_is_decoded_ = decodeColorFrameToBuffer(frame_set->colorFrame(), rgb_buffer_);
-    publishPointCloud(frame_set);
+    // rgb_is_decoded_ = decodeColorFrameToBuffer(frame_set->colorFrame(), rgb_buffer_);
+    std::shared_ptr<ob::ColorFrame> colorFrame = frame_set->colorFrame();
+    if (enable_stream_[COLOR] && colorFrame) {
+      std::lock_guard<std::mutex> colorLock(colorFrameMtx_);
+      colorFrameQueue_.push(frame_set);
+      colorFrameCV_.notify_all();
+    } else {
+      publishPointCloud(frame_set);
+    }
+
     for (const auto& stream_index : IMAGE_STREAMS) {
       if (enable_stream_[stream_index]) {
         auto frame_type = STREAM_TYPE_TO_FRAME_TYPE.at(stream_index.first);
+        if (frame_type == OB_FRAME_COLOR) {
+          continue;
+        }
+
         auto frame = frame_set->getFrame(frame_type);
         if (frame == nullptr) {
           ROS_DEBUG_STREAM("frame type " << frame_type << " is null");
@@ -780,7 +930,7 @@ void OBCameraNode::onNewFrameSetCallback(const std::shared_ptr<ob::FrameSet>& fr
         }
 
         std::shared_ptr<ob::Frame> irFrame = decodeIRMJPGFrame(frame);
-        if(irFrame) {
+        if (irFrame) {
           onNewFrameCallback(irFrame, stream_index);
         } else {
           onNewFrameCallback(frame, stream_index);
@@ -794,6 +944,26 @@ void OBCameraNode::onNewFrameSetCallback(const std::shared_ptr<ob::FrameSet>& fr
   } catch (...) {
     ROS_ERROR_STREAM("onNewFrameSetCallback error: unknown error");
   }
+}
+
+void OBCameraNode::onNewColorFrameCallback() {
+  while (enable_stream_[COLOR] && ros::ok() && is_running_.load()) {
+    std::unique_lock<std::mutex> lock(colorFrameMtx_);
+    colorFrameCV_.wait(lock,
+                       [this]() { return !colorFrameQueue_.empty() || !(is_running_.load()); });
+
+    if (!ros::ok() || !is_running_.load()) {
+      break;
+    }
+
+    std::shared_ptr<ob::FrameSet> frameSet = colorFrameQueue_.front();
+    rgb_is_decoded_ = decodeColorFrameToBuffer(frameSet->colorFrame(), rgb_buffer_);
+    publishPointCloud(frameSet);
+    onNewFrameCallback(frameSet->colorFrame(), IMAGE_STREAMS.at(2));
+    colorFrameQueue_.pop();
+  }
+
+  ROS_INFO_STREAM("Color frame thread exit!");
 }
 
 std::shared_ptr<ob::Frame> OBCameraNode::softwareDecodeColorFrame(
@@ -843,18 +1013,30 @@ void OBCameraNode::onNewFrameCallback(const std::shared_ptr<ob::Frame>& frame,
   }
   int width = static_cast<int>(video_frame->width());
   int height = static_cast<int>(video_frame->height());
-
-  auto timestamp = frameTimeStampToROSTime(video_frame->systemTimeStamp());
-  if (!camera_params_ && depth_registration_) {
+  auto frame_time_stamp =
+      use_hardware_time_ ? video_frame->timeStamp() : video_frame->systemTimeStamp();
+  auto timestamp = frameTimeStampToROSTime(frame_time_stamp);
+  if (!camera_params_) {
     camera_params_ = pipeline_->getCameraParam();
-  } else if (!camera_params_ && stream_index == COLOR) {
-    camera_params_ = getCameraColorParam();
-  } else if (!camera_params_ && (stream_index == DEPTH || stream_index == INFRA0)) {
-    camera_params_ = getCameraDepthParam();
   }
+
   std::string frame_id =
       depth_registration_ ? depth_aligned_frame_id_[stream_index] : optical_frame_id_[stream_index];
-  if (camera_params_) {
+  if (color_camera_info_manager_ && color_camera_info_manager_->isCalibrated() &&
+      stream_index == COLOR) {
+    auto camera_info_publisher = camera_info_publishers_[stream_index];
+    auto camera_info = color_camera_info_manager_->getCameraInfo();
+    camera_info.header.stamp = timestamp;
+    camera_info.header.frame_id = frame_id;
+    camera_info_publisher.publish(camera_info);
+  } else if (ir_camera_info_manager_ && ir_camera_info_manager_->isCalibrated() &&
+             (stream_index == INFRA0 || stream_index == DEPTH)) {
+    auto camera_info_publisher = camera_info_publishers_[stream_index];
+    auto camera_info = ir_camera_info_manager_->getCameraInfo();
+    camera_info.header.stamp = timestamp;
+    camera_info.header.frame_id = frame_id;
+    camera_info_publisher.publish(camera_info);
+  } else if (camera_params_) {
     auto& intrinsic =
         stream_index == COLOR ? camera_params_->rgbIntrinsic : camera_params_->depthIntrinsic;
     auto& distortion =
@@ -895,10 +1077,12 @@ void OBCameraNode::onNewFrameCallback(const std::shared_ptr<ob::Frame>& frame,
   auto image_msg =
       cv_bridge::CvImage(std_msgs::Header(), encoding_[stream_index], image).toImageMsg();
   CHECK_NOTNULL(image_msg.get());
+  auto& seq = image_seq_[stream_index];
   image_msg->header.stamp = timestamp;
   image_msg->is_bigendian = false;
   image_msg->step = width * unit_step_size_[stream_index];
   image_msg->header.frame_id = frame_id;
+  image_msg->header.seq = seq++;
 
   if (!flip_images_[stream_index]) {
     image_publisher.publish(image_msg);
@@ -926,28 +1110,43 @@ void OBCameraNode::saveImageToFile(const stream_index_pair& stream_index, const 
     ss << std::put_time(localtime(&now), "%Y%m%d_%H%M%S");
     auto current_path = boost::filesystem::current_path().string();
     auto fps = fps_[stream_index];
+    int index = save_images_count_[stream_index];
+    std::string file_suffix = stream_index == COLOR ? ".png" : ".raw";
     std::string filename = current_path + "/image/" + stream_name_[stream_index] + "_" +
                            std::to_string(image_msg->width) + "x" +
                            std::to_string(image_msg->height) + "_" + std::to_string(fps) + "hz_" +
-                           ss.str() + ".png";
+                           ss.str() + "_" + std::to_string(index) + file_suffix;
     if (!boost::filesystem::exists(current_path + "/image")) {
       boost::filesystem::create_directory(current_path + "/image");
     }
     ROS_INFO_STREAM("Saving image to " << filename);
-    if (stream_index.first == OB_STREAM_DEPTH) {
-      auto image_to_save = cv_bridge::toCvCopy(image_msg, encoding_[stream_index])->image;
-      cv::imwrite(filename, image_to_save);
-    } else if (stream_index.first == OB_STREAM_COLOR) {
+    if (stream_index.first == OB_STREAM_COLOR) {
       auto image_to_save =
           cv_bridge::toCvCopy(image_msg, sensor_msgs::image_encodings::BGR8)->image;
       cv::imwrite(filename, image_to_save);
     } else if (stream_index.first == OB_STREAM_IR || stream_index.first == OB_STREAM_IR_LEFT ||
-               stream_index.first == OB_STREAM_IR_RIGHT) {
-      cv::imwrite(filename, image);
+               stream_index.first == OB_STREAM_IR_RIGHT || stream_index.first == OB_STREAM_DEPTH) {
+      std::ofstream ofs(filename, std::ios::out | std::ios::binary);
+      if (!ofs.is_open()) {
+        ROS_ERROR_STREAM("Failed to open file: " << filename);
+        return;
+      }
+      if (image.isContinuous()) {
+        ofs.write(reinterpret_cast<const char*>(image.data), image.total() * image.elemSize());
+      } else {
+        int rows = image.rows;
+        int cols = image.cols * image.channels();
+        for (int r = 0; r < rows; ++r) {
+          ofs.write(reinterpret_cast<const char*>(image.ptr<uchar>(r)), cols);
+        }
+      }
+      ofs.close();
     } else {
       ROS_ERROR_STREAM("Unsupported stream type: " << stream_index.first);
     }
-    save_images_[stream_index] = false;
+    if (++save_images_count_[stream_index] >= max_save_images_count_) {
+      save_images_[stream_index] = false;
+    }
   }
 }
 
@@ -981,10 +1180,18 @@ void OBCameraNode::imuSubscribedCallback(const orbbec_camera::stream_index_pair&
   ROS_INFO_STREAM("IMU stream " << stream_name_[stream_index] << " subscribed");
   std::lock_guard<decltype(device_lock_)> lock(device_lock_);
   try {
-    if (imu_started_[stream_index]) {
-      ROS_INFO_STREAM("IMU stream " << stream_name_[stream_index] << " is already started.");
-      return;
+    if (enable_sync_output_accel_gyro_) {
+      if (imu_sync_output_start_) {
+        ROS_INFO_STREAM("IMU stream accel and gyro are already started.");
+        return;
+      }
+    } else {
+      if (imu_started_[stream_index]) {
+        ROS_INFO_STREAM("IMU stream " << stream_name_[stream_index] << " is already started.");
+        return;
+      }
     }
+
     startIMU(stream_index);
   } catch (const ob::Error& e) {
     ROS_ERROR_STREAM("Failed to start streams: " << e.getMessage());
@@ -1036,7 +1243,11 @@ void OBCameraNode::imageUnsubscribedCallback(const stream_index_pair& stream_ind
 }
 
 void OBCameraNode::imuUnsubscribedCallback(const stream_index_pair& stream_index) {
-  ROS_INFO_STREAM("IMU stream " << stream_name_[stream_index] << " unsubscribed");
+  if (enable_sync_output_accel_gyro_) {
+    ROS_INFO_STREAM("IMU stream accel and gyro unsubscribed");
+  } else {
+    ROS_INFO_STREAM("IMU stream " << stream_name_[stream_index] << " unsubscribed");
+  }
   std::lock_guard<decltype(device_lock_)> lock(device_lock_);
   stopIMU(stream_index);
 }
@@ -1178,6 +1389,8 @@ void OBCameraNode::calcAndPublishStaticTransform() {
   auto ex = camera_param.transform;
   Q = rotationMatrixToQuaternion(ex.rot);
   Q = quaternion_optical * Q * quaternion_optical.inverse();
+  auto device_info = device_->getDeviceInfo();
+  auto device_pid = device_info->pid();
   for (int i = 0; i < 3; i++) {
     trans[i] = ex.trans[i];
   }
@@ -1189,7 +1402,11 @@ void OBCameraNode::calcAndPublishStaticTransform() {
   Q = transform.getRotation();
   trans = transform.getOrigin();
   if (enable_stream_[COLOR]) {
-    publishStaticTF(tf_timestamp, trans, Q, camera_link_frame_id_, frame_id_[COLOR]);
+    if (device_pid != FEMTO_BOLT_PID) {
+      publishStaticTF(tf_timestamp, trans, Q, camera_link_frame_id_, frame_id_[COLOR]);
+    } else {
+      publishStaticTF(tf_timestamp, trans, zero_rot, camera_link_frame_id_, frame_id_[COLOR]);
+    }
     publishStaticTF(tf_timestamp, zero_trans, quaternion_optical, frame_id_[COLOR],
                     optical_frame_id_[COLOR]);
   }
@@ -1197,20 +1414,18 @@ void OBCameraNode::calcAndPublishStaticTransform() {
     if (stream_index == COLOR || !enable_stream_[stream_index]) {
       continue;
     }
-    publishStaticTF(tf_timestamp, zero_trans, zero_rot, camera_link_frame_id_,
-                    frame_id_[stream_index]);
-    publishStaticTF(tf_timestamp, zero_trans, quaternion_optical, frame_id_[stream_index],
-                    optical_frame_id_[stream_index]);
-  }
-  for (const auto& stream_index : HID_STREAMS) {
-    if (!enable_stream_[stream_index]) {
-      continue;
+    if (device_pid != FEMTO_BOLT_PID) {
+      publishStaticTF(tf_timestamp, zero_trans, zero_rot, camera_link_frame_id_,
+                      frame_id_[stream_index]);
+    } else {
+      publishStaticTF(tf_timestamp, zero_trans, Q, camera_link_frame_id_, frame_id_[stream_index]);
     }
-    publishStaticTF(tf_timestamp, zero_trans, zero_rot, camera_link_frame_id_,
-                    frame_id_[stream_index]);
     publishStaticTF(tf_timestamp, zero_trans, quaternion_optical, frame_id_[stream_index],
                     optical_frame_id_[stream_index]);
   }
+  publishStaticTF(tf_timestamp, zero_trans, zero_rot, camera_link_frame_id_, imu_frame_id_);
+  publishStaticTF(tf_timestamp, zero_trans, quaternion_optical, imu_frame_id_,
+                  imu_optical_frame_id_);
 }
 
 void OBCameraNode::publishDynamicTransforms() {
