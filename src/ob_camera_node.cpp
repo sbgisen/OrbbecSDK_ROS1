@@ -91,9 +91,10 @@ void OBCameraNode::getParameters() {
   camera_name_ = nh_private_.param<std::string>("camera_name", "camera");
   camera_link_frame_id_ = camera_name_ + "_link";
   for (const auto& stream_index : IMAGE_STREAMS) {
-    frame_id_[stream_index] = camera_name_ + "_" + stream_name_[stream_index] + "_frame";
+    std::string stream_name = stream_index != COLOR ? stream_name_[stream_index] : "rgb";
+    frame_id_[stream_index] = camera_name_ + "_" + stream_name + "_frame";
     optical_frame_id_[stream_index] =
-        camera_name_ + "_" + stream_name_[stream_index] + "_optical_frame";
+        camera_name_ + "_" + stream_name + "_optical_frame";
   }
   for (const auto& stream_index : IMAGE_STREAMS) {
     std::string param_name = stream_name_[stream_index] + "_width";
@@ -146,6 +147,7 @@ void OBCameraNode::getParameters() {
   enable_color_auto_exposure_ = nh_private_.param<bool>("enable_color_auto_exposure", true);
   enable_ir_auto_exposure_ = nh_private_.param<bool>("enable_ir_auto_exposure", true);
   enable_ir_long_exposure_ = nh_private_.param<bool>("enable_ir_long_exposure", false);
+  ir_scale_ = nh_private_.param<double>("ir_scale", 1.0);
   sync_mode_str_ = nh_private_.param<std::string>("sync_mode", "free_run");
   std::transform(sync_mode_str_.begin(), sync_mode_str_.end(), sync_mode_str_.begin(), ::toupper);
   sync_mode_ = OBSyncModeFromString(sync_mode_str_);
@@ -1072,6 +1074,8 @@ void OBCameraNode::onNewFrameCallback(const std::shared_ptr<ob::Frame>& frame,
   if (stream_index == DEPTH) {
     auto depth_scale = video_frame->as<ob::DepthFrame>()->getValueScale();
     image = image * depth_scale;
+  } else if (stream_index == INFRA0) {
+    image = image * ir_scale_;
   }
   auto image_publisher = image_publishers_[stream_index];
   auto image_msg =
@@ -1423,9 +1427,12 @@ void OBCameraNode::calcAndPublishStaticTransform() {
     publishStaticTF(tf_timestamp, zero_trans, quaternion_optical, frame_id_[stream_index],
                     optical_frame_id_[stream_index]);
   }
-  publishStaticTF(tf_timestamp, zero_trans, zero_rot, camera_link_frame_id_, imu_frame_id_);
-  publishStaticTF(tf_timestamp, zero_trans, quaternion_optical, imu_frame_id_,
-                  imu_optical_frame_id_);
+  for (const auto& stream_index : HID_STREAMS) {
+    publishStaticTF(tf_timestamp, zero_trans, zero_rot, camera_link_frame_id_,
+                    frame_id_[stream_index]);
+    publishStaticTF(tf_timestamp, zero_trans, quaternion_optical, frame_id_[stream_index],
+                    optical_frame_id_[stream_index]);
+  }
 }
 
 void OBCameraNode::publishDynamicTransforms() {
